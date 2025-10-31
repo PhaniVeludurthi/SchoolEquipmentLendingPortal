@@ -16,7 +16,7 @@ namespace EquipmentLendingApi.Controllers
         private readonly ILogger<RequestsController> _logger = logger;
 
         [HttpGet]
-        public async Task<IActionResult> List()
+        public async Task<IActionResult> List([FromQuery] string? status = null)
         {
             var userEmail = User.Identity?.Name;
             var userId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
@@ -24,9 +24,24 @@ namespace EquipmentLendingApi.Controllers
 
             _logger.LogInformation("Fetching requests for user: {Email}, Role: {Role}", userEmail, userRole);
 
-            var requests = userRole == "admin" || userRole == "staff"
-                ? await _db.Requests.Include(r => r.Equipment).Include(r => r.User).Include(x => x.Approver).ToListAsync()
-                : await _db.Requests.Include(r => r.Equipment).Include(r => r.User).Include(x => x.Approver).Where(r => r.UserId == userId).ToListAsync();
+            IQueryable<Request> query = _db.Requests
+            .Include(r => r.Equipment)
+            .Include(r => r.User)
+            .Include(r => r.Approver);
+
+            // Filter by role
+            if (userRole != "admin" && userRole != "staff")
+            {
+                query = query.Where(r => r.UserId == userId);
+            }
+
+            // Filter by status if provided
+            if (!string.IsNullOrEmpty(status))
+            {
+                query = query.Where(r => r.Status.ToLower() == status.ToLower());
+            }
+
+            var requests = await query.OrderByDescending(x => x.RequestedAt).ToListAsync();
 
             _logger.LogInformation("Retrieved {Count} requests", requests.Count);
             return Ok(ApiResponse<List<Request>>.SuccessResponse(requests, "Requests retrieved successfully"));
@@ -49,63 +64,93 @@ namespace EquipmentLendingApi.Controllers
             }
             _logger.LogInformation("Borrow request for equipment {EquipmentId} by user {UserId}", dto.EquipmentId, userId);
 
-            // Check if equipment exists
-            var equipment = await _db.Equipment.FindAsync(dto.EquipmentId);
-            if (equipment == null)
+            await using var transaction = await _db.Database.BeginTransactionAsync();
+
+            try
             {
-                _logger.LogWarning("Equipment not found: {EquipmentId}", dto.EquipmentId);
-                return NotFound(ApiResponse<Request>.NotFoundResponse("Equipment not found"));
+                // Check if equipment exists and lock the row
+                var equipment = await _db.Equipment
+                    .FromSqlRaw(@"
+                    SELECT * FROM ""Equipment"" 
+                    WHERE ""Id"" = {0} 
+                    FOR UPDATE", dto.EquipmentId)
+                    .FirstOrDefaultAsync();
+
+                if (equipment == null || equipment.IsDeleted)
+                {
+                    _logger.LogWarning("Equipment not found: {EquipmentId}", dto.EquipmentId);
+                    return NotFound(ApiResponse<Request>.NotFoundResponse("Equipment not found"));
+                }
+
+                // Check quantity availability
+                if (dto.Quantity <= 0)
+                {
+                    return BadRequest(ApiResponse<Request>.ErrorResponse("Quantity must be greater than 0", 400));
+                }
+
+                if (dto.Quantity > equipment.Quantity)
+                {
+                    return BadRequest(ApiResponse<Request>.ErrorResponse($"Requested quantity exceeds total available ({equipment.Quantity})", 400));
+                }
+
+                var hasPendingRequest = await _db.Requests.AnyAsync(r =>
+                                r.UserId == userId &&
+                                r.EquipmentId == dto.EquipmentId &&
+                                r.Status.ToLower() == "pending");
+
+                if (hasPendingRequest)
+                {
+                    _logger.LogWarning("User already has pending request for equipment: {EquipmentId}", dto.EquipmentId);
+                    return BadRequest(ApiResponse<Request>.ErrorResponse("You already have a pending request for this equipment", 400));
+                }
+
+                // Check if user already has approved/issued request for same equipment
+                var hasActiveRequest = await _db.Requests.AnyAsync(r =>
+                    r.UserId == userId &&
+                    r.EquipmentId == dto.EquipmentId &&
+                    (r.Status.ToLower() == "approved" || r.Status.ToLower() == "issued"));
+
+                if (hasActiveRequest)
+                {
+                    _logger.LogWarning("User already has active request for equipment: {EquipmentId}", dto.EquipmentId);
+                    return BadRequest(ApiResponse<Request>.ErrorResponse("You already have an active request for this equipment", 400));
+                }
+
+                var request = new Request
+                {
+                    UserId = userId,
+                    EquipmentId = dto.EquipmentId,
+                    RequestedAt = DateTime.UtcNow,
+                    Quantity = dto.Quantity,
+                    Notes = dto.Notes,
+                    Status = "pending"
+                };
+
+                await _db.Requests.AddAsync(request);
+                await _db.SaveChangesAsync();
+
+                // Load navigation properties
+                await transaction.CommitAsync();
+
+                // Load navigation properties for response
+                request.Equipment = equipment;
+                request.User = new User { Id = user.Id, FullName = user.FullName, Email = user.Email, Role = user.Role };
+
+                _logger.LogInformation("Borrow request created successfully: {RequestId}", request.Id);
+                return Ok(ApiResponse<Request>.SuccessResponse(request, "Borrow request submitted successfully"));
             }
-
-            // Check quantity availability
-            if (equipment.AvailableQuantity < 1)
+            catch (DbUpdateConcurrencyException)
             {
-                _logger.LogWarning("Equipment unavailable: {EquipmentId}", dto.EquipmentId);
-                return BadRequest(ApiResponse<Request>.ErrorResponse("Equipment is currently unavailable", 400));
+                await transaction.RollbackAsync();
+                _logger.LogWarning("Concurrency conflict when creating request for equipment: {EquipmentId}", dto.EquipmentId);
+                return Conflict(ApiResponse<Request>.ErrorResponse("Equipment is being updated. Please try again.", 409));
             }
-
-            // Check for overlapping approved requests
-            var hasOverlap = await _db.Requests.AnyAsync(r =>
-                r.EquipmentId == dto.EquipmentId &&
-                r.Status.ToLower() == "approved");
-
-            if (hasOverlap)
+            catch (Exception ex)
             {
-                _logger.LogWarning("Overlapping request detected for equipment: {EquipmentId}", dto.EquipmentId);
-                return BadRequest(ApiResponse<Request>.ErrorResponse("Equipment is already borrowed for the selected dates", 400));
+                await transaction.RollbackAsync();
+                _logger.LogError(ex, "Error creating borrow request");
+                return StatusCode(500, ApiResponse<Request>.ErrorResponse("An error occurred while processing your request", 500));
             }
-
-            // Check if user has pending requests for same equipment
-            var hasPendingRequest = await _db.Requests.AnyAsync(r =>
-                r.UserId == userId &&
-                r.EquipmentId == dto.EquipmentId &&
-                r.Status.ToLower() == "pending");
-
-            if (hasPendingRequest)
-            {
-                _logger.LogWarning("User already has pending request for equipment: {EquipmentId}", dto.EquipmentId);
-                return BadRequest(ApiResponse<Request>.ErrorResponse("You already have a pending request for this equipment", 400));
-            }
-
-            var request = new Request
-            {
-                UserId = userId,
-                EquipmentId = dto.EquipmentId,
-                RequestedAt = DateTime.UtcNow,
-                Quantity = dto.Quantity,
-                Notes = dto.Notes,
-                Status = "pending"
-            };
-
-            await _db.Requests.AddAsync(request);
-            await _db.SaveChangesAsync();
-
-            // Load navigation properties
-            request.Equipment = equipment;
-            request.User = new() { Id = user.Id, FullName = user.FullName, Email = user.Email, Role = user.Role };
-
-            _logger.LogInformation("Borrow request created successfully: {RequestId}", request.Id);
-            return Ok(ApiResponse<Request>.SuccessResponse(request, "Borrow request submitted successfully"));
         }
 
         [HttpGet("pending")]
@@ -118,171 +163,218 @@ namespace EquipmentLendingApi.Controllers
                 .Where(r => r.Status.ToLowerInvariant() == "pending")
                 .Include(r => r.Equipment)
                 .Include(r => r.User)
+                .OrderBy(r => r.RequestedAt)
                 .ToListAsync();
 
             _logger.LogInformation("Retrieved {Count} pending requests", pending.Count);
             return Ok(ApiResponse<List<Request>>.SuccessResponse(pending, "Pending requests retrieved successfully"));
         }
 
-        [HttpPut("{id}/approve")]
-        [Authorize(Policy = "StaffOrAdmin")]
-        public async Task<IActionResult> Approve(string id, ApproveDto dto)
-        {
-            _logger.LogInformation("Processing approval for request: {RequestId}, Approve: {Approve}", id, dto.Approve);
-
-            var request = await _db.Requests.Include(r => r.Equipment).Include(r => r.User).FirstOrDefaultAsync(r => r.Id == id);
-            if (request == null)
-            {
-                _logger.LogWarning("Request not found: {RequestId}", id);
-                return NotFound(ApiResponse<Request>.NotFoundResponse($"Request with ID {id} not found"));
-            }
-
-            if (request.Status.ToLowerInvariant() != "pending")
-            {
-                _logger.LogWarning("Request already processed: {RequestId}, Status: {Status}", id, request.Status);
-                return BadRequest(ApiResponse<Request>.ErrorResponse($"Request is already {request.Status.ToLower()}", 400));
-            }
-
-            request.Status = dto.Approve ? "approved" : "rejected";
-            await _db.SaveChangesAsync();
-
-            var message = dto.Approve ? "Request approved successfully" : "Request rejected successfully";
-            _logger.LogInformation("Request {RequestId} {Status}", id, request.Status);
-
-            return Ok(ApiResponse<Request>.SuccessResponse(request, message));
-        }
-
-        [HttpPut("{id}/return")]
-        public async Task<IActionResult> Return(string id)
-        {
-            var userId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
-            var userRole = User.FindFirst(ClaimTypes.Role)?.Value;
-
-            _logger.LogInformation("Processing return for request: {RequestId} by user: {UserId}", id, userId);
-
-            var request = await _db.Requests.Include(r => r.Equipment).Include(r => r.User).FirstOrDefaultAsync(r => r.Id == id);
-            if (request == null)
-            {
-                _logger.LogWarning("Request not found: {RequestId}", id);
-                return NotFound(ApiResponse<Request>.NotFoundResponse($"Request with ID {id} not found"));
-            }
-
-            // Only the requestor or staff/admin can mark as returned
-            if (request.UserId != userId && userRole != "staff" && userRole != "admin")
-            {
-                _logger.LogWarning("Unauthorized return attempt for request: {RequestId} by user: {UserId}", id, userId);
-                return Forbid();
-            }
-
-            if (request.Status.ToLowerInvariant() != "approved")
-            {
-                _logger.LogWarning("Cannot return request that is not approved: {RequestId}, Status: {Status}", id, request.Status);
-                return BadRequest(ApiResponse<Request>.ErrorResponse("Only approved requests can be returned", 400));
-            }
-
-            request.Status = "returned";
-            await _db.SaveChangesAsync();
-
-            _logger.LogInformation("Request marked as returned: {RequestId}", id);
-            return Ok(ApiResponse<Request>.SuccessResponse(request, "Equipment returned successfully"));
-        }
         [HttpPut("{id}")]
+        [Authorize(Policy = "StaffOrAdmin")]
         public async Task<ActionResult<RequestDto>> UpdateRequest(string id, [FromBody] UpdateRequestDto update)
         {
-            var request = await _db.Requests
-                .Include(r => r.Equipment)
-                .Include(r => r.User)
-                .Include(r => r.Approver)
-                .FirstOrDefaultAsync(r => r.Id == id);
+            var currentUserId = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
 
-            if (request == null)
-            {
-                return NotFound(new { message = "Request not found" });
-            }
-
-            // Update only the provided fields
-            if (update.Status != null)
-            {
-                var currentStatus = request.Status.ToLowerInvariant();
-                var newStatus = update.Status.ToLowerInvariant();
-
-                if (!IsValidStatusTransition(currentStatus, newStatus))
-                {
-                    return BadRequest(new { message = $"Invalid status transition from {request.Status} to {update.Status}" });
-                }
-
-                var oldStatus = request.Status;
-                request.Status = update.Status;
-
-                // Handle equipment quantity when status changes
-                if (newStatus == "approved" && oldStatus == "pending")
-                {
-                    // Reserve equipment quantity
-                    if (request.Equipment != null)
-                    {
-                        if (request.Equipment.AvailableQuantity < request.Quantity)
-                        {
-                            return BadRequest(new { message = "Insufficient equipment quantity available" });
-                        }
-                        request.Equipment.AvailableQuantity -= request.Quantity;
-                    }
-                }
-                else if (update.Status == "returned" || update.Status == "cancelled")
-                {
-                    // Return equipment quantity
-                    if (request.Equipment != null && (oldStatus == "approved" || oldStatus == "issued"))
-                    {
-                        request.Equipment.AvailableQuantity += request.Quantity;
-                    }
-                }
-            }
-
-            if (update.ApprovedAt.HasValue)
-            {
-                request.ApprovedAt = update.ApprovedAt;
-            }
-
-            if (update.ApprovedBy != null)
-            {
-                request.ApprovedBy = update.ApprovedBy;
-            }
-
-            if (update.IssuedAt.HasValue)
-            {
-                request.IssuedAt = update.IssuedAt;
-            }
-
-            if (update.DueDate.HasValue)
-            {
-                request.DueDate = update.DueDate;
-            }
-
-            if (update.ReturnedAt.HasValue)
-            {
-                request.ReturnedAt = update.ReturnedAt;
-            }
-
-            if (update.AdminNotes != null)
-            {
-                request.AdminNotes = update.AdminNotes;
-            }
-
+            // Use transaction with appropriate isolation level
+            await using var transaction = await _db.Database.BeginTransactionAsync(
+                System.Data.IsolationLevel.ReadCommitted);
             try
             {
+                var request = await _db.Requests
+                    .Include(r => r.Equipment)
+                    .Include(r => r.User)
+                    .Include(r => r.Approver)
+                    .FirstOrDefaultAsync(r => r.Id == id);
+
+                if (request == null)
+                {
+                    return NotFound(ApiResponse<Request>.NotFoundResponse("Request not found"));
+                }
+                var currentStatus = request.Status.ToLowerInvariant();
+                Equipment? equipment = null;
+
+                // Handle status changes
+                if (update.Status != null)
+                {
+                    var newStatus = update.Status.ToLowerInvariant();
+
+                    // Validate status transition
+                    if (!IsValidStatusTransition(currentStatus, newStatus))
+                    {
+                        return BadRequest(ApiResponse<Request>.ErrorResponse(
+                            $"Invalid status transition from {request.Status} to {update.Status}", 400));
+                    }
+
+                    // Lock equipment row if we're going to modify quantity
+                    if (RequiresEquipmentUpdate(currentStatus, newStatus))
+                    {
+                        // Use pessimistic locking to prevent race conditions
+                        equipment = await _db.Equipment
+                                                .FromSqlRaw(@"
+                            SELECT * FROM ""Equipment"" 
+                            WHERE ""Id"" = {0} 
+                            FOR UPDATE", request.EquipmentId)
+                                                .FirstOrDefaultAsync();
+
+                        if (equipment == null || equipment.IsDeleted)
+                        {
+                            return NotFound(ApiResponse<Request>.NotFoundResponse("Equipment not found"));
+                        }
+                    }
+
+                    // Handle quantity changes based on status transition
+                    var quantityChange = CalculateQuantityChange(currentStatus, newStatus, request.Quantity);
+
+                    if (quantityChange != 0 && equipment != null)
+                    {
+                        var newAvailableQuantity = equipment.AvailableQuantity + quantityChange;
+
+                        // Validate quantity bounds
+                        if (newAvailableQuantity < 0)
+                        {
+                            return BadRequest(ApiResponse<Request>.ErrorResponse(
+                                $"Insufficient equipment quantity available. Available: {equipment.AvailableQuantity}, " +
+                                $"Requested: {request.Quantity}", 400));
+                        }
+
+                        if (newAvailableQuantity > equipment.Quantity)
+                        {
+                            return BadRequest(ApiResponse<Request>.ErrorResponse(
+                                "Available quantity cannot exceed total quantity", 400));
+                        }
+
+                        equipment.AvailableQuantity = newAvailableQuantity;
+                        _logger.LogInformation(
+                            "Equipment {EquipmentId} quantity changed by {Change}. New available: {Available}",
+                            equipment.Id, quantityChange, equipment.AvailableQuantity);
+                    }
+
+                    // Update request status
+                    var oldStatus = request.Status;
+                    request.Status = update.Status;
+
+                    // Set status-specific fields
+                    switch (newStatus)
+                    {
+                        case "approved":
+                            request.ApprovedAt = update.ApprovedAt ?? DateTime.UtcNow;
+                            request.ApprovedBy = currentUserId;
+                            request.DueDate = update.DueDate;
+                            break;
+
+                        case "rejected":
+                            request.RejectedAt = DateTime.UtcNow;
+                            request.RejectedBy = currentUserId;
+                            break;
+
+                        case "issued":
+                            request.IssuedAt = update.IssuedAt ?? DateTime.UtcNow;
+                            break;
+
+                        case "returned":
+                            request.ReturnedAt = update.ReturnedAt ?? DateTime.UtcNow;
+                            break;
+                    }
+
+                    _logger.LogInformation(
+                        "Request {RequestId} status changed from {OldStatus} to {NewStatus} by {UserId}",
+                        id, oldStatus, newStatus, currentUserId);
+                }
+
+                // Update other fields if provided
+                if (update.ApprovedAt.HasValue && request.ApprovedAt == null)
+                {
+                    request.ApprovedAt = update.ApprovedAt;
+                }
+
+                if (update.ApprovedBy != null && request.ApprovedBy == null)
+                {
+                    request.ApprovedBy = update.ApprovedBy;
+                }
+
+                if (update.IssuedAt.HasValue && request.IssuedAt == null)
+                {
+                    request.IssuedAt = update.IssuedAt;
+                }
+
+                if (update.DueDate.HasValue)
+                {
+                    request.DueDate = update.DueDate;
+                }
+
+                if (update.ReturnedAt.HasValue && request.ReturnedAt == null)
+                {
+                    request.ReturnedAt = update.ReturnedAt;
+                }
+
+                if (update.AdminNotes != null)
+                {
+                    request.AdminNotes = update.AdminNotes;
+                }
+
+                // Save changes and commit transaction
                 await _db.SaveChangesAsync();
+                await transaction.CommitAsync();
+
+                // Reload navigation properties for response
+                await _db.Entry(request).ReloadAsync();
+                await _db.Entry(request).Reference(r => r.Equipment).LoadAsync();
+                await _db.Entry(request).Reference(r => r.User).LoadAsync();
+                await _db.Entry(request).Reference(r => r.Approver).LoadAsync();
+
+                _logger.LogInformation("Request {RequestId} updated successfully", id);
+                return Ok(ApiResponse<RequestResponseDto>.SuccessResponse(
+                    MapToDto(request), "Request updated successfully"));
+            }
+            catch (DbUpdateConcurrencyException ex)
+            {
+                await transaction.RollbackAsync();
+                _logger.LogWarning(ex, "Concurrency conflict updating request {RequestId}", id);
+                return Conflict(ApiResponse<Request>.ErrorResponse(
+                    "Request or equipment was updated by another user. Please refresh and try again.", 409));
             }
             catch (DbUpdateException ex)
             {
-                return StatusCode(500, new { message = "Error updating request", error = ex.Message });
+                await transaction.RollbackAsync();
+                _logger.LogError(ex, "Database error updating request {RequestId}", id);
+                return StatusCode(500, ApiResponse<Request>.ErrorResponse(
+                    "Error updating request: " + ex.Message, 500));
             }
+            catch (Exception ex)
+            {
+                await transaction.RollbackAsync();
+                _logger.LogError(ex, "Unexpected error updating request {RequestId}", id);
+                return StatusCode(500, ApiResponse<Request>.ErrorResponse(
+                    "An unexpected error occurred while updating the request", 500));
+            }
+        }
+        private static bool RequiresEquipmentUpdate(string currentStatus, string newStatus)
+        {
+            // Reserve quantity: pending → approved
+            if (currentStatus == "pending" && newStatus == "approved")
+                return true;
 
-            // Reload to get updated navigation properties
-            await _db.Entry(request).ReloadAsync();
-            await _db.Entry(request).Reference(r => r.Equipment).LoadAsync();
-            await _db.Entry(request).Reference(r => r.User).LoadAsync();
-            await _db.Entry(request).Reference(r => r.Approver).LoadAsync();
+            // Return quantity: approved/issued → returned/cancelled
+            if ((currentStatus == "approved" || currentStatus == "issued") &&
+                (newStatus == "returned" || newStatus == "cancelled"))
+                return true;
 
-            return Ok(MapToDto(request));
+            return false;
+        }
+
+        private static int CalculateQuantityChange(string currentStatus, string newStatus, int requestQuantity)
+        {
+            // Reserve quantity (decrease available): pending → approved
+            if (currentStatus == "pending" && newStatus == "approved")
+                return -requestQuantity;
+
+            // Return quantity (increase available): approved/issued → returned/cancelled
+            if ((currentStatus == "approved" || currentStatus == "issued") &&
+                (newStatus == "returned" || newStatus == "cancelled"))
+                return requestQuantity;
+
+            return 0;
         }
 
         private bool IsValidStatusTransition(string currentStatus, string newStatus)

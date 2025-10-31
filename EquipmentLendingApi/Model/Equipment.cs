@@ -1,4 +1,6 @@
-﻿namespace EquipmentLendingApi.Model
+﻿using System.ComponentModel.DataAnnotations;
+
+namespace EquipmentLendingApi.Model
 {
     public class Equipment
     {
@@ -12,6 +14,8 @@
         public bool IsDeleted { get; set; }
         public DateTime? DeletedAt { get; set; }
         public string? DeletedBy { get; set; }
+        [Timestamp]
+        public byte[]? RowVersion { get; set; }
         public ICollection<Request> Requests { get; set; } = [];
     }
 }

@@ -15,6 +15,8 @@
         public DateTime? ReturnedAt { get; set; }
         public string? Notes { get; set; }
         public string? AdminNotes { get; set; }
+        public DateTime? RejectedAt { get; set; }
+        public string? RejectedBy { get; set; }
         public User? User { get; set; }
         public User? Approver { get; set; }
         public Equipment? Equipment { get; set; }
