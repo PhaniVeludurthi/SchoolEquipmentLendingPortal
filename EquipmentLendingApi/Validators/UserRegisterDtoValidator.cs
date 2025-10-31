@@ -7,7 +7,7 @@ namespace EquipmentLendingApi.Validators
     {
         public UserRegisterDtoValidator()
         {
-            RuleFor(x => x.Name)
+            RuleFor(x => x.FullName)
                 .NotEmpty().WithMessage("Name is required")
                 .MinimumLength(2).WithMessage("Name must be at least 2 characters")
                 .MaximumLength(100).WithMessage("Name cannot exceed 100 characters");
@@ -22,8 +22,8 @@ namespace EquipmentLendingApi.Validators
 
             RuleFor(x => x.Role)
                 .NotEmpty().WithMessage("Role is required")
-                .Must(role => new[] { "Student", "Staff", "Admin" }.Contains(role))
-                .WithMessage("Role must be Student, Staff, or Admin");
+                .Must(role => new[] { "student", "staff", "admin" }.Contains(role))
+                .WithMessage("Role must be student, staff, or admin");
         }
     }
 }

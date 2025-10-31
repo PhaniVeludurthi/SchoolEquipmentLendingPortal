@@ -2,14 +2,21 @@
 {
     public class Request
     {
-        public int Id { get; set; }
-        public int UserId { get; set; }
-        public int EquipmentId { get; set; }
-        public DateTime StartDate { get; set; }
-        public DateTime EndDate { get; set; }
-        public string Status { get; set; } = "Pending"; // Pending, Approved, Rejected, Returned
-
+        public string Id { get; set; }
+        public string UserId { get; set; }
+        public string EquipmentId { get; set; }
+        public int Quantity { get; set; }
+        public DateTime? IssuedAt { get; set; }
+        public DateTime? DueDate { get; set; }
+        public string Status { get; set; } = "pending";
+        public DateTime? RequestedAt { get; set; }
+        public DateTime? ApprovedAt { get; set; }
+        public string? ApprovedBy { get; set; }
+        public DateTime? ReturnedAt { get; set; }
+        public string? Notes { get; set; }
+        public string? AdminNotes { get; set; }
         public User? User { get; set; }
+        public User? Approver { get; set; }
         public Equipment? Equipment { get; set; }
     }
 }

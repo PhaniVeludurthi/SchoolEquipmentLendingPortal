@@ -46,8 +46,8 @@ try
         });
 
     builder.Services.AddAuthorizationBuilder()
-        .AddPolicy("AdminOnly", policy => policy.RequireRole("Admin"))
-        .AddPolicy("StaffOrAdmin", policy => policy.RequireRole("Staff", "Admin"));
+        .AddPolicy("AdminOnly", policy => policy.RequireRole("admin"))
+        .AddPolicy("StaffOrAdmin", policy => policy.RequireRole("staff", "admin"));
 
     builder.Services.AddValidatorsFromAssemblyContaining<UserRegisterDtoValidator>();
 
@@ -104,7 +104,7 @@ try
         });
     });
 
-    var allowedOrigins = builder.Configuration["AllowedOrigings"];
+    var allowedOrigins = builder.Configuration["AllowedOrigins"];
     // Add CORS
     builder.Services.AddCors(options =>
     {
@@ -137,6 +137,8 @@ try
         // Enable authorization persistence
         options.EnablePersistAuthorization();
     });
+
+    app.UseCors("AllowFrontend");
 
     app.UseAuthentication();
     app.UseAuthorization();

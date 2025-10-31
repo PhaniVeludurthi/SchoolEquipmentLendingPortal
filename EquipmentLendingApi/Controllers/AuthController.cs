@@ -32,7 +32,7 @@ namespace EquipmentLendingApi.Controllers
 
                 var user = new User
                 {
-                    Name = dto.Name,
+                    FullName = dto.FullName,
                     Email = dto.Email,
                     PasswordHash = BCrypt.Net.BCrypt.HashPassword(dto.Password),
                     Role = dto.Role
@@ -86,7 +86,7 @@ namespace EquipmentLendingApi.Controllers
                     new
                     {
                         token = new JwtSecurityTokenHandler().WriteToken(token),
-                        user = new { id = user.Id, name = user.Name, email = user.Email, role = user.Role }
+                        user = new { id = user.Id, fullName = user.FullName, email = user.Email, role = user.Role }
                     },
                     "Login successful"
                 ));
